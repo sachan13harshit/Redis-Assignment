@@ -1,23 +1,23 @@
-# Use official Go image as base
-FROM golang:alpine
+# Use a specific Go version
+FROM golang:1.20-alpine
 
-# Set working directory inside container
+# Set working directory
 WORKDIR /app
 
-# Copy go mod files first for layer caching
-COPY go.mod ./
+# Copy go.mod and go.sum first (for better layer caching)
+COPY go.mod go.sum* ./
 
-# Download dependencies - this creates a separate layer that can be cached
+# Download dependencies (if you have a go.mod)
 RUN go mod download
 
-# Copy source code into container
-COPY . .
+# Copy the source code
+COPY *.go ./
 
-# Build Go application inside container
-RUN go build -o lru_cache main.go
+# Build with verbose output to see more details about any failures
+RUN go build -v -o redis_cache_server
 
-# Expose port for HTTP requests
+# Expose the port
 EXPOSE 7171
 
-# Command to run application when container starts
-CMD ["./lru_cache"]
+# Run the application
+CMD ["./redis_cache_server"]
