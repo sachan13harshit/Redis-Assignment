@@ -1,396 +1,296 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
-	"net/http/pprof" // HTTP profiling handlers
 	"os"
 	"runtime"
-	rpprof "runtime/pprof" // Runtime profiling tools with renamed import
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/dgraph-io/ristretto"
-	jsoniter "github.com/json-iterator/go"
+	"github.com/cespare/xxhash/v2"
 	"github.com/valyala/fasthttp"
-	"github.com/valyala/fasthttp/fasthttpadaptor"
 )
 
-// Use json-iterator with fastest config for maximized JSON performance
-var json = jsoniter.ConfigFastest
+const (
+	// Maximum allowed length for keys and values.
+	MaxStringLength = 256
 
-// ShardedCache with optimized sharding
-type ShardedCache struct {
-	shards     []*ristretto.Cache
-	shardCount uint32
-	shardMask  uint32 // For faster shard selection using bitwise AND
-}
+	// Default configuration values.
+	DefaultMaxEntries         = 1000000      
+	DefaultMemoryThreshold    = 70          
+	DefaultCacheCheckInterval = 5 * time.Second
 
-// Pre-allocate common response strings
-var (
-	keyNotFoundBytes   = []byte(`{"status":"ERROR","message":"Key not found"}`)
-	invalidRequestBytes = []byte(`{"status":"ERROR","message":"Invalid request body or missing key/value"}`)
-	missingKeyBytes    = []byte(`{"status":"ERROR","message":"Missing key parameter"}`)
-	successPutBytes    = []byte(`{"status":"OK","message":"Key submitted for insertion/update"}`)
+	
+	NumShards = 256
 )
 
-// NewShardedCache creates a sharded cache with power-of-2 shards for faster selection
-func NewShardedCache(shardBits int, capacityPerShard int64) (*ShardedCache, error) {
-	// Use power-of-2 shards for faster selection with bitwise AND
-	shardCount := 1 << shardBits // 2^shardBits
-	shardMask := uint32(shardCount - 1)
-	
-	if shardCount <= 0 {
-		return nil, fmt.Errorf("shardCount must be positive")
-	}
-	if capacityPerShard <= 0 {
-		return nil, fmt.Errorf("capacityPerShard must be positive")
-	}
 
-	shards := make([]*ristretto.Cache, shardCount)
-	
-	// Configure Ristretto for higher performance
-	for i := 0; i < shardCount; i++ {
-		cache, err := ristretto.NewCache(&ristretto.Config{
-			NumCounters: capacityPerShard * 20,  // Increase counters for better accuracy
-			MaxCost:     capacityPerShard,
-			BufferItems: 1024,                   // Larger buffer for better throughput
-			Metrics:     false,                  // Disable metrics for performance
-			KeyToHash:   nil,                    // Use default (FNV-1a) but avoid key conversion
-			Cost:        nil,                    // Use default cost function
-			IgnoreInternalCost: true,            // Ignore internal cost calculations
-		})
-		if err != nil {
-			// Cleanup on error
-			for j := 0; j < i; j++ {
-				shards[j].Close()
-			}
-			return nil, fmt.Errorf("failed to create cache shard %d: %w", i, err)
-		}
-		shards[i] = cache
-	}
-	
-	return &ShardedCache{
-		shards:     shards,
-		shardCount: uint32(shardCount),
-		shardMask:  shardMask,
-	}, nil
-}
-
-// Optimized hash function for byte slices
-func fnvHashBytes(key []byte) uint32 {
-	// FNV-1a 32-bit hash
-	h := uint32(2166136261)
-	for i := 0; i < len(key); i++ {
-		h ^= uint32(key[i])
-		h *= 16777619
-	}
-	return h
-}
-
-// getShard returns the cache shard for a key using bitwise AND for faster selection
-func (sc *ShardedCache) getShard(key []byte) *ristretto.Cache {
-	// Use mask for faster modulo operation (works because shardCount is power of 2)
-	return sc.shards[fnvHashBytes(key) & sc.shardMask]
-}
-
-// Put stores a key-value pair in the cache
-func (sc *ShardedCache) Put(key []byte, value []byte) bool {
-	shard := sc.getShard(key)
-	
-	// Make a copy of the value to prevent corruption from reuse
-	valueCopy := make([]byte, len(value))
-	copy(valueCopy, value)
-	
-	// Convert key to string for Ristretto (required for its key type)
-	return shard.Set(string(key), valueCopy, 1)
-}
-
-// Get retrieves a value from the cache
-func (sc *ShardedCache) Get(key []byte) ([]byte, bool) {
-	shard := sc.getShard(key)
-	
-	// Get value from cache
-	value, found := shard.Get(string(key))
-	if !found {
-		return nil, false
-	}
-	
-	// Type assertion with direct return
-	if byteValue, ok := value.([]byte); ok {
-		return byteValue, true
-	}
-	
-	return nil, false
-}
-
-// Close releases all cache resources
-func (sc *ShardedCache) Close() {
-	for _, shard := range sc.shards {
-		shard.Close()
-	}
-}
-
-// --- Request/Response Management with Advanced Pooling ---
-
-// PutRequest represents the JSON structure for PUT requests
-type PutRequest struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
-
-// Pool for PutRequest objects
-var putRequestPool = sync.Pool{
-	New: func() interface{} {
-		return &PutRequest{}
-	},
-}
-
-// Pool for byte slices to reduce GC pressure
-var bytesPool = sync.Pool{
-	New: func() interface{} {
-		// Pre-allocate with a reasonable size (adjust based on average size)
-		return make([]byte, 0, 1024)
-	},
-}
-
-// getByteSlice gets a byte slice from the pool
-func getByteSlice() []byte {
-	return bytesPool.Get().([]byte)[:0] // Reset length but keep capacity
-}
-
-// putByteSlice returns a byte slice to the pool
-func putByteSlice(b []byte) {
-	// Only return to pool if under reasonable size
-	if cap(b) <= 8192 {
-		bytesPool.Put(b)
-	}
-}
-
-// SuccessResponse represents a successful operation
-type SuccessResponse struct {
+type CacheResponse struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`
 	Key     string `json:"key,omitempty"`
 	Value   string `json:"value,omitempty"`
 }
 
-// Pool for success responses
-var successResponsePool = sync.Pool{
-	New: func() interface{} {
-		return &SuccessResponse{Status: "OK"}
-	},
+func successResponse(key, value string) CacheResponse {
+	return CacheResponse{Status: "OK", Key: key, Value: value}
 }
 
-// --- Global Cache ---
-var cache *ShardedCache
-
-// --- Optimized HTTP Handlers ---
-
-// putHandler processes PUT requests
-func putHandler(ctx *fasthttp.RequestCtx) {
-	// Get request object from pool
-	req := putRequestPool.Get().(*PutRequest)
-	defer putRequestPool.Put(req)
-	req.Key = ""   // Reset fields
-	req.Value = ""
-
-	// Fast path check for empty body
-	if len(ctx.PostBody()) == 0 {
-		ctx.SetContentType("application/json")
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.Write(invalidRequestBytes)
-		return
-	}
-
-	// Decode request body
-	err := json.Unmarshal(ctx.PostBody(), req)
-	if err != nil || req.Key == "" || req.Value == "" {
-		ctx.SetContentType("application/json")
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.Write(invalidRequestBytes)
-		return
-	}
-
-	// Store in cache
-	cache.Put([]byte(req.Key), []byte(req.Value))
-
-	// Use pre-allocated success response
-	ctx.SetContentType("application/json")
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.Write(successPutBytes)
+func errorResponse(msg string) CacheResponse {
+	return CacheResponse{Status: "ERROR", Message: msg}
 }
 
-// getHandler processes GET requests
-func getHandler(ctx *fasthttp.RequestCtx) {
-	// Get key from query args
-	keyBytes := ctx.QueryArgs().Peek("key")
-	if len(keyBytes) == 0 {
-		ctx.SetContentType("application/json")
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.Write(missingKeyBytes)
-		return
-	}
 
-	// Get from cache
-	valueBytes, found := cache.Get(keyBytes)
-	if !found {
-		ctx.SetContentType("application/json")
-		ctx.SetStatusCode(fasthttp.StatusNotFound)
-		ctx.Write(keyNotFoundBytes)
-		return
-	}
-
-	// Prepare success response
-	resp := successResponsePool.Get().(*SuccessResponse)
-	defer successResponsePool.Put(resp)
-	resp.Key = string(keyBytes)
-	resp.Value = string(valueBytes)
-	resp.Message = ""
-
-	// Get byte buffer from pool
-	buf := getByteSlice()
-	defer putByteSlice(buf)
-
-	// Encode response directly to buffer
-	encodedResponse, err := json.Marshal(resp)
-	if err != nil {
-		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
-		return
-	}
-
-	// Write response
-	ctx.SetContentType("application/json")
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.Write(encodedResponse)
+type PutRequest struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
-// healthHandler provides a simple health check endpoint
-func healthHandler(ctx *fasthttp.RequestCtx) {
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.SetContentType("text/plain")
-	ctx.WriteString("OK")
+
+type CacheEntry struct {
+	value     string
+	frequency int64 // Updated via atomic operations.
 }
+
+
+type shard struct {
+	lock sync.RWMutex
+	m    map[string]*CacheEntry
+}
+
+
+type ShardedCache struct {
+	shards     []*shard
+	numShards  uint64
+	maxEntries int
+
+	// Global count of entries (avoiding costly full scans).
+	count int64
+}
+
+
+func NewShardedCache(numShards, maxEntries int) *ShardedCache {
+	s := make([]*shard, numShards)
+	for i := 0; i < numShards; i++ {
+		s[i] = &shard{
+			m: make(map[string]*CacheEntry),
+		}
+	}
+	return &ShardedCache{
+		shards:     s,
+		numShards:  uint64(numShards),
+		maxEntries: maxEntries,
+		count:      0,
+	}
+}
+
+func (sc *ShardedCache) getShard(key string) *shard {
+	h := xxhash.Sum64String(key)
+	return sc.shards[h&(sc.numShards-1)]
+}
+
+
+func (sc *ShardedCache) Size() int {
+	return int(atomic.LoadInt64(&sc.count))
+}
+
+
+func (sc *ShardedCache) Put(key, value string) bool {
+	if key == "" || value == "" || len(key) > MaxStringLength || len(value) > MaxStringLength {
+		return false
+	}
+	// If we've reached maximum capacity, evict roughly 10% of entries.
+	if atomic.LoadInt64(&sc.count) >= int64(sc.maxEntries) {
+		evictCount := sc.maxEntries / 10
+		sc.EvictGlobal(evictCount)
+	}
+	s := sc.getShard(key)
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if entry, exists := s.m[key]; exists {
+		entry.value = value
+		atomic.StoreInt64(&entry.frequency, 1)
+	} else {
+		s.m[key] = &CacheEntry{
+			value:     value,
+			frequency: 1,
+		}
+		atomic.AddInt64(&sc.count, 1)
+	}
+	return true
+}
+
+
+func (sc *ShardedCache) Get(key string) (string, bool) {
+	if key == "" || len(key) > MaxStringLength {
+		return "", false
+	}
+	s := sc.getShard(key)
+	s.lock.RLock()
+	entry, ok := s.m[key]
+	s.lock.RUnlock()
+	if !ok {
+		return "", false
+	}
+	atomic.AddInt64(&entry.frequency, 1)
+	return entry.value, true
+}
+
+
+func (sc *ShardedCache) EvictGlobal(count int) {
+	type candidate struct {
+		shardIndex int
+		key        string
+		frequency  int64
+	}
+
+	candidates := make([]candidate, 0, count*2)
+	for i, s := range sc.shards {
+		s.lock.RLock()
+		for k, entry := range s.m {
+			candidates = append(candidates, candidate{
+				shardIndex: i,
+				key:        k,
+				frequency:  atomic.LoadInt64(&entry.frequency),
+			})
+		}
+		s.lock.RUnlock()
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].frequency < candidates[j].frequency
+	})
+	if count > len(candidates) {
+		count = len(candidates)
+	}
+	for i := 0; i < count; i++ {
+		c := candidates[i]
+		s := sc.shards[c.shardIndex]
+		s.lock.Lock()
+		if _, exists := s.m[c.key]; exists {
+			delete(s.m, c.key)
+			atomic.AddInt64(&sc.count, -1)
+		}
+		s.lock.Unlock()
+	}
+}
+
+func memoryMonitor(sc *ShardedCache, memoryThreshold int, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		var memStats runtime.MemStats
+		runtime.ReadMemStats(&memStats)
+		usagePercent := 0
+		if memStats.HeapSys > 0 {
+			usagePercent = int((memStats.HeapAlloc * 100) / memStats.HeapSys)
+		}
+		if usagePercent > memoryThreshold {
+			currentSize := sc.Size()
+			evictCount := currentSize / 4 // Evict 25% of entries.
+			sc.EvictGlobal(evictCount)
+			log.Printf("High memory usage: %d%%, evicted %d entries", usagePercent, evictCount)
+		}
+	}
+}
+
+// requestHandler processes HTTP requests for /put and /get endpoints.
+func requestHandler(ctx *fasthttp.RequestCtx, cache *ShardedCache) {
+	switch string(ctx.Path()) {
+	case "/put":
+		if string(ctx.Method()) != "POST" {
+			ctx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
+			return
+		}
+		var req PutRequest
+		if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			resp, _ := json.Marshal(errorResponse("Invalid request body"))
+			ctx.SetBody(resp)
+			return
+		}
+		if req.Key == "" || req.Value == "" {
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			resp, _ := json.Marshal(errorResponse("Key and value cannot be null"))
+			ctx.SetBody(resp)
+			return
+		}
+		if len(req.Key) > MaxStringLength || len(req.Value) > MaxStringLength {
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			resp, _ := json.Marshal(errorResponse("Key or value exceeds maximum length"))
+			ctx.SetBody(resp)
+			return
+		}
+		if cache.Put(req.Key, req.Value) {
+			resp, _ := json.Marshal(successResponse(req.Key, req.Value))
+			ctx.SetBody(resp)
+		} else {
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			resp, _ := json.Marshal(errorResponse("Failed to insert key"))
+			ctx.SetBody(resp)
+		}
+	case "/get":
+		if string(ctx.Method()) != "GET" {
+			ctx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
+			return
+		}
+		key := string(ctx.QueryArgs().Peek("key"))
+		if key == "" {
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			resp, _ := json.Marshal(errorResponse("Missing key parameter"))
+			ctx.SetBody(resp)
+			return
+		}
+		if value, ok := cache.Get(key); ok {
+			resp, _ := json.Marshal(successResponse(key, value))
+			ctx.SetBody(resp)
+		} else {
+			resp, _ := json.Marshal(errorResponse("Key not found"))
+			ctx.SetBody(resp)
+		}
+	default:
+		ctx.Error("Endpoint not found", fasthttp.StatusNotFound)
+	}
+}
+
 
 func main() {
-	// Enable profiling if needed
-	if os.Getenv("ENABLE_PROFILING") == "1" {
-		f, err := os.Create("cpu.prof")
-		if err != nil {
-			log.Fatal("could not create CPU profile: ", err)
-		}
-		defer f.Close()
-		if err := rpprof.StartCPUProfile(f); err != nil {
-			log.Fatal("could not start CPU profile: ", err)
-		}
-		defer rpprof.StopCPUProfile()
-		
-		// Schedule heap profile
-		go func() {
-			time.Sleep(30 * time.Second)
-			hf, err := os.Create("heap.prof")
-			if err != nil {
-				log.Fatal("could not create heap profile: ", err)
-			}
-			defer hf.Close()
-			if err := rpprof.WriteHeapProfile(hf); err != nil {
-				log.Fatal("could not write heap profile: ", err)
-			}
-		}()
-	}
-
-	// Use all available CPU cores
-	numCPU := runtime.NumCPU()
-	runtime.GOMAXPROCS(numCPU)
-
-	// Configure GC for higher throughput (trade memory for speed)
-	// Increase GC threshold to reduce GC frequency
-	// GOGC=200 means GC triggers when heap size is 200% of live data
-	if os.Getenv("GOGC") == "" {
-		os.Setenv("GOGC", "200")
-	}
-
-	// Pre-allocate memory to reduce GC impact during high load
-	// Adjust based on expected memory usage
-	runtime.MemProfileRate = 0 // Disable memory profiling in production
-
-	// --- Cache Initialization ---
-	// Use power of 2 for shard count (for bitwise operations)
-	shardBits := 4 // 2^4 = 16 shards
-	if numCPU > 8 {
-		shardBits = 5 // 2^5 = 32 shards for high-core machines
-	}
 	
-	shardCount := 1 << shardBits
-	totalCapacity := int64(2 * 1000 * 1000) // Target 2M items (increased from 1M)
-	capacityPerShard := totalCapacity / int64(shardCount)
+	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	var err error
-	cache, err = NewShardedCache(shardBits, capacityPerShard)
-	if err != nil {
-		log.Fatalf("Failed to initialize sharded cache: %v", err)
-	}
-	defer cache.Close()
-
-	log.Printf("Initialized cache with %d shards, capacity/shard: %d (Total ~%d)",
-		shardCount, capacityPerShard, totalCapacity)
-
-	// --- HTTP Server Setup ---
-	router := func(ctx *fasthttp.RequestCtx) {
-		path := string(ctx.Path())
-		method := string(ctx.Method())
-		
-		switch {
-		case path == "/put" && method == "POST":
-			putHandler(ctx)
-		case path == "/get" && method == "GET":
-			getHandler(ctx)
-		case path == "/health":
-			healthHandler(ctx)
-		case path == "/debug/pprof" || path == "/debug/pprof/":
-			fasthttpadaptor.NewFastHTTPHandlerFunc(pprof.Index)(ctx)
-		case path == "/debug/pprof/cmdline":
-			fasthttpadaptor.NewFastHTTPHandlerFunc(pprof.Cmdline)(ctx)
-		case path == "/debug/pprof/profile":
-			fasthttpadaptor.NewFastHTTPHandlerFunc(pprof.Profile)(ctx)
-		case path == "/debug/pprof/symbol":
-			fasthttpadaptor.NewFastHTTPHandlerFunc(pprof.Symbol)(ctx)
-		case path == "/debug/pprof/trace":
-			fasthttpadaptor.NewFastHTTPHandlerFunc(pprof.Trace)(ctx)
-		default:
-			ctx.Error("Not Found", fasthttp.StatusNotFound)
-		}
+	
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "7171"
 	}
 
-	// Configure the fasthttp server for maximum performance
+	
+	cache := NewShardedCache(NumShards, DefaultMaxEntries)
+
+	
+	go memoryMonitor(cache, DefaultMemoryThreshold, DefaultCacheCheckInterval)
+
+
 	server := &fasthttp.Server{
-		Handler:                       router,
-		Name:                          "GoKVStore",
-		ReadBufferSize:                16 * 1024,      // Increased buffer size
-		WriteBufferSize:               16 * 1024,      // Increased buffer size
-		ReadTimeout:                   5 * time.Second,
-		WriteTimeout:                  5 * time.Second,
-		IdleTimeout:                   60 * time.Second, // Keep connections alive longer
-		MaxConnsPerIP:                 0,              // No limit
-		MaxRequestsPerConn:            0,              // Unlimited
-		Concurrency:                   512 * 1024,     // Higher concurrency
-		ReduceMemoryUsage:             true,           // Reduce memory usage
-		GetOnly:                       false,          // Support all methods
-		DisableHeaderNamesNormalizing: true,           // Skip normalizing headers
-		NoDefaultServerHeader:         true,           // Skip default server header
-		NoDefaultDate:                 true,           // Skip default date
-		NoDefaultContentType:          false,          // Keep content type
-		KeepHijackedConns:             false,          // Don't keep hijacked connections
+		Handler: func(ctx *fasthttp.RequestCtx) {
+			requestHandler(ctx, cache)
+		},
+		Name:                 "OptimizedCacheServer",
+		ReadBufferSize:       64 * 1024,
+		WriteBufferSize:      64 * 1024,
+		MaxKeepaliveDuration: 300 * time.Second,
 	}
 
-	// Listen address
-	addr := ":7171"
-	if envPort := os.Getenv("PORT"); envPort != "" {
-		addr = ":" + envPort
-	}
-
-	log.Printf("Starting fasthttp server on %s", addr)
+	addr := ":" + port
+	fmt.Printf("Starting cache server on %s\n", addr)
 	if err := server.ListenAndServe(addr); err != nil {
-		log.Fatalf("Error in ListenAndServe: %s", err)
+		log.Fatalf("ListenAndServe error: %s", err)
 	}
 }
